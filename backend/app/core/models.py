@@ -24,6 +24,8 @@ class ParseResultStatus(Enum):
     FIELD_MISSING = "field_missing"
     ENCODING_ERROR = "encoding_error"
     LINE_EMPTY = "line_empty"
+    # 格式可解析但缺少来源归属凭据，先隔离、待补证后解除。
+    CREDENTIAL_MISSING = "credential_missing"
 
 
 class MaskMethod(Enum):
@@ -47,6 +49,9 @@ class LogSourceConfig:
     encoding: str = "utf-8"
     collect_method: str = "file_tail"
     access_state: str = "待验证"
+    # 来源已证实的时区偏移（如 "+08:00"）；隔离解除时用它还原事件时间，
+    # 不能用放行时的当前时间替代。
+    timezone_offset: str = "+00:00"
 
     def match_format(self, line: str) -> bool:
         """校验一条日志行是否匹配此来源的格式。"""
@@ -111,6 +116,11 @@ class LogEntry:
     event_time: datetime | None = None
     host: str = ""
     checksum: str = field(default="")
+    # 隔离解除链路：隔离标记、原日志位置、解除批次与实际放行凭据。
+    quarantined: bool = False
+    source_location: str = ""
+    release_order_id: str = ""
+    release_evidence_id: str = ""
 
     def compute_checksum(self) -> str:
         """基于原始行和解析字段计算内容校验哈希。"""
@@ -118,6 +128,14 @@ class LogEntry:
             f"{self.source_id}|{self.line_number}|{self.raw_line[:200]}"
             f"|{sorted((self.parsed_fields or {}).items())}"
         )
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    def raw_checksum(self) -> str:
+        """只针对来源位置 + 原行正文计算哈希——用于隔离前快照的一致性核对。
+
+        不包含解析字段：即使解析凭据后补，原行被替换也能被识别出来。
+        """
+        raw = f"{self.source_id}|{self.source_location or self.line_number}|{self.raw_line}"
         return hashlib.sha256(raw.encode()).hexdigest()
 
     def __post_init__(self):
@@ -226,6 +244,10 @@ class EventRecord:
     source_host: str
     store_partition: str = ""
     index_state: str = "已写入"
+    # 隔离解除放行的事件留痕：来自哪个解除批次，空串表示普通行直采。
+    release_order_id: str = ""
+    source_location: str = ""
+    release_evidence_id: str = ""
 
 
 @dataclass

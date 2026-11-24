@@ -8,7 +8,7 @@ from __future__ import annotations
 import hashlib
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.core.models import (
@@ -29,6 +29,7 @@ PRESET_LOG_SOURCES: dict[str, LogSourceConfig] = {
         encoding="utf-8",
         collect_method="file_tail",
         access_state="已接入",
+        timezone_offset="+08:00",
     ),
     "app-backend": LogSourceConfig(
         source_id="LOG_-0002",
@@ -39,6 +40,7 @@ PRESET_LOG_SOURCES: dict[str, LogSourceConfig] = {
         encoding="utf-8",
         collect_method="file_tail",
         access_state="已接入",
+        timezone_offset="+08:00",
     ),
     "sys-auth": LogSourceConfig(
         source_id="LOG_-0003",
@@ -49,6 +51,7 @@ PRESET_LOG_SOURCES: dict[str, LogSourceConfig] = {
         encoding="utf-8",
         collect_method="file_tail",
         access_state="已接入",
+        timezone_offset="+08:00",
     ),
 }
 
@@ -119,6 +122,45 @@ class IngestPipelineState:
     quality_report: QualityReport | None = None
 
 
+def parse_timezone_offset(offset_text: str) -> timezone:
+    """把 "+08:00"/"-05:30" 形式的来源时区还原成 tzinfo。"""
+    sign = 1 if offset_text.startswith("+") else -1
+    hours_text, minutes_text = offset_text.lstrip("+-").split(":")
+    return timezone(sign * timedelta(hours=int(hours_text), minutes=int(minutes_text)))
+
+
+# 各解析规则承载时间戳的字段名。
+_TIME_FIELD_BY_FORMAT: dict[str, str] = {
+    "access": "time_local",
+    "app": "timestamp",
+    "sys": "sys_time",
+}
+
+
+def extract_event_time(rule: ParseRule, source: LogSourceConfig,
+                       fields: dict[str, str]) -> datetime | None:
+    """从解析字段 + 来源时区还原事件发生时间。
+
+    隔离解除时必须还原到原发生时间，不能用放行时的当前时间替代：
+    - 自带偏移的时间戳（access 日志 %z）按自身偏移解析；
+    - 不带偏移的时间戳（app/sys 日志）套用来源已证实的时区；
+    - sys 日志没有年份，按来源时区补当前年。
+    """
+    time_field = _TIME_FIELD_BY_FORMAT.get(source.log_format, "")
+    raw_time = (fields or {}).get(time_field)
+    if not raw_time:
+        return None
+    try:
+        parsed = datetime.strptime(raw_time, rule.time_format)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=parse_timezone_offset(source.timezone_offset))
+        if source.log_format == "sys":
+            parsed = parsed.replace(year=datetime.now(parsed.tzinfo).year)
+    return parsed
+
+
 class IngestPipeline:
     """核心采集管道：log_source → parser_rule → ingest_job → event_store。
 
@@ -155,8 +197,14 @@ class IngestPipeline:
             ))
         return entries
 
-    def apply_parse_rules(self, entries: list[LogEntry], rule: ParseRule) -> list[LogEntry]:
-        """用解析规则从日志条目中提取字段。"""
+    def apply_parse_rules(self, entries: list[LogEntry], rule: ParseRule,
+                          source: LogSourceConfig | None = None) -> list[LogEntry]:
+        """用解析规则从日志条目中提取字段。
+
+        解析通过仅代表格式可用：被隔离（缺归属凭据）的行即使解析 OK 也继续
+        保留 quarantined 标记，等实际解除后才允许进入 classify_events。
+        同时按来源时区还原事件发生时间，供后续按原发生日分区。
+        """
         for entry in entries:
             if entry.parse_status == ParseResultStatus.FORMAT_MISMATCH:
                 continue
@@ -164,6 +212,8 @@ class IngestPipeline:
             entry.parse_status = status
             entry.parsed_fields = fields or {}
             entry.checksum = entry.compute_checksum()
+            if source is not None and status == ParseResultStatus.OK and fields:
+                entry.event_time = extract_event_time(rule, source, fields) or entry.event_time
         return entries
 
     def run_ingest_job(self, entries: list[LogEntry], job: IngestJob) -> list[LogEntry]:
@@ -186,16 +236,27 @@ class IngestPipeline:
 
         数据流入口：event_store ← 解析后的 LogEntry
         分类依据：日志级别（app log → error/access）或来源标识
+
+        隔离纪律：quarantined 行（含 apply_parse_rules 已解析通过但凭据缺失的
+        行）一律不分类，必须等解除批次获准、标记实际解除后才进入正式分类。
+        分区按事件自身发生时间（来源时区）落，不用运行时当前时间。
         """
         records: list[EventRecord] = []
         host_counter: dict[str, int] = {}
         for entry in entries:
+            if entry.quarantined:
+                continue
             if entry.parse_status != ParseResultStatus.OK or not entry.parsed_fields:
                 continue
             event_type = self._classify_entry(entry)
-            host = entry.parsed_fields.get("client_ip") or entry.parsed_fields.get("hostname") or "unknown"
+            # 隔离解除行优先采用归属凭据证实的机器 host；普通行回退到解析字段。
+            host = (entry.host
+                    or entry.parsed_fields.get("client_ip")
+                    or entry.parsed_fields.get("hostname")
+                    or "unknown")
             host_counter[host] = host_counter.get(host, 0) + 1
-            partition = f"{datetime.now():%Y%m%d}"
+            event_time = entry.event_time or datetime.now()
+            partition = self._partition_of(event_time)
             record = EventRecord(
                 record_id=f"EVEN-{host_counter[host]:06d}",
                 event_type=event_type,
@@ -203,19 +264,39 @@ class IngestPipeline:
                 parsed_fields=dict(entry.parsed_fields),
                 masked_fields={},
                 enriched_fields={},
-                event_time=entry.event_time or datetime.now(),
+                event_time=event_time,
                 source_host=host,
                 store_partition=partition,
                 index_state="已写入",
+                release_order_id=entry.release_order_id,
+                source_location=entry.source_location,
+                release_evidence_id=entry.release_evidence_id,
             )
             records.append(record)
         return records
 
+    @staticmethod
+    def _partition_of(event_time: datetime) -> str:
+        """按事件时间所在的来源本地日期生成存储分区（YYYYMMDD）。"""
+        return f"{event_time:%Y%m%d}"
+
     def store_events(self, records: list[EventRecord]) -> int:
-        """写入 event_store 并返回存储条数。"""
+        """写入 event_store 并返回本次新存储条数。
+
+        按原始内容指纹幂等：并发/超时重试同一批放行只落库一次。
+        """
+        stored = 0
         for record in records:
-            self._event_store.setdefault(record.source_host, []).append(record)
-        return len(records)
+            bucket = self._event_store.setdefault(record.source_host, [])
+            fingerprint = hashlib.sha256(
+                f"{record.source_host}|{record.original_content}|{record.event_time.isoformat()}".encode()
+            ).hexdigest()
+            if fingerprint in self._fingerprint_seen:
+                continue
+            self._fingerprint_seen.add(fingerprint)
+            bucket.append(record)
+            stored += 1
+        return stored
 
     # ---------- 数据流 2: ingest_job → batch_checkpoint（断点恢复） ----------
 
